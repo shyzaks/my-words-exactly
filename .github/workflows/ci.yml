@@ -1,0 +1,30 @@
+name: ci
+on:
+  push: { branches: [ main ] }
+  pull_request:
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS creds via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push smoke image
+        run: |
+          docker build -t ${{ vars.ECR_REPO }}:smoke - <<'DOCKERFILE'
+          FROM public.ecr.aws/docker/library/python:3.11-slim
+          CMD ["python","-c","print('hello from mwe baseline')"]
+          DOCKERFILE
+          docker push ${{ vars.ECR_REPO }}:smoke
