@@ -1,0 +1,243 @@
+locals { name = "${var.project}-${var.env}" }
+
+resource "aws_ecr_repository" "api" {
+  name = "${local.name}-api"
+  image_scanning_configuration { scan_on_push = true }
+  force_delete = true
+}
+
+# ---------- Networking (VPC, Subnets, Routing) ----------
+# VPC with DNS enabled
+resource "aws_vpc" "mwe" {
+  cidr_block           = "10.20.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags                 = { Name = "${local.name}-vpc" }
+}
+
+# Get available AZs so we can spread subnets
+data "aws_availability_zones" "available" { state = "available" }
+
+# Two PUBLIC subnets (auto-assign public IPs) in two AZs
+resource "aws_subnet" "public" {
+  count                   = 2
+  vpc_id                  = aws_vpc.mwe.id
+  cidr_block              = cidrsubnet(aws_vpc.mwe.cidr_block, 4, count.index) # 10.20.0.0/20, 10.20.16.0/20
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+  tags                    = { Name = "${local.name}-public-${count.index}" }
+}
+
+# Two PRIVATE subnets (no public IPs) in two AZs
+resource "aws_subnet" "private" {
+  count             = 2
+  vpc_id            = aws_vpc.mwe.id
+  cidr_block        = cidrsubnet(aws_vpc.mwe.cidr_block, 4, count.index + 8) # 10.20.128.0/20, 10.20.144.0/20
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+  tags              = { Name = "${local.name}-private-${count.index}" }
+}
+
+# Internet access for public subnets
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.mwe.id
+  tags   = { Name = "${local.name}-igw" }
+}
+
+# Allocate one Elastic IP for a single NAT gateway (cost-efficient)
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags   = { Name = "${local.name}-nat-eip" }
+}
+
+# NAT gateway so PRIVATE subnets can reach the internet (for package pulls, etc.)
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+  tags          = { Name = "${local.name}-nat" }
+  depends_on    = [aws_internet_gateway.igw]
+}
+
+# Public route table → 0.0.0.0/0 via Internet Gateway
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.mwe.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.igw.id
+  }
+  tags = { Name = "${local.name}-public-rt" }
+}
+
+# Associate public subnets with the public route table
+resource "aws_route_table_association" "public_assoc" {
+  count          = length(aws_subnet.public)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+# Private route table → 0.0.0.0/0 via NAT gateway
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.mwe.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat.id
+  }
+  tags = { Name = "${local.name}-private-rt" }
+}
+
+# Associate private subnets with the private route table
+resource "aws_route_table_association" "private_assoc" {
+  count          = length(aws_subnet.private)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+
+
+# ---------- Data bucket (versioned) ----------
+resource "random_id" "sfx" {
+  byte_length = 3
+}
+
+resource "aws_s3_bucket" "data" {
+  bucket = "${local.name}-data-${random_id.sfx.hex}"
+  tags   = { Name = "${local.name}-data" }
+}
+
+resource "aws_s3_bucket_versioning" "data_v" {
+  bucket = aws_s3_bucket.data.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+
+# ---------- GitHub OIDC for CI/CD ----------
+# Allows GitHub Actions to exchange an OIDC token for temporary AWS creds
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"] # GitHub's OIDC thumbprint
+}
+
+# Trust policy: allow only your repo to assume the role
+data "aws_iam_policy_document" "gha_assume" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
+    }
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    # Restrict to a specific repo path: owner/repo:*
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:${var.github_owner}/${var.github_repo}:*"]
+    }
+  }
+}
+
+# The role GitHub Actions will assume
+resource "aws_iam_role" "gha_deploy" {
+  name               = "${local.name}-github-deploy"
+  assume_role_policy = data.aws_iam_policy_document.gha_assume.json
+  tags               = { Name = "${local.name}-github-deploy" }
+}
+
+# Attach a broad policy for now (we will tighten later)
+resource "aws_iam_role_policy_attachment" "gha_poweruser" {
+  role       = aws_iam_role.gha_deploy.name
+  policy_arn = "arn:aws:iam::aws:policy/PowerUserAccess"
+}
+
+
+# ---------- ECS (empty cluster for now) ----------
+resource "aws_ecs_cluster" "this" {
+  name = "${local.name}-cluster"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
+  tags = { Name = "${local.name}-cluster" }
+}
+
+
+# ---------- IAM for ECS tasks ----------
+# Execution role: lets the task pull images from ECR and push logs to CloudWatch
+data "aws_iam_policy_document" "ecs_task_exec_assume" {
+  statement {
+    effect = "Allow"
+    principals { type = "Service" identifiers = ["ecs-tasks.amazonaws.com"] }
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "ecs_task_execution" {
+  name               = "${local.name}-ecs-task-exec"
+  assume_role_policy = data.aws_iam_policy_document.ecs_task_exec_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_exec_attach" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# (Optional) Task role: the app's own AWS permissions (empty for now)
+resource "aws_iam_role" "ecs_task_role" {
+  name               = "${local.name}-ecs-task-role"
+  assume_role_policy = data.aws_iam_policy_document.ecs_task_exec_assume.json
+}
+
+# ---------- Logging ----------
+resource "aws_cloudwatch_log_group" "api" {
+  name              = "/ecs/${local.name}-api"
+  retention_in_days = 14
+}
+
+
+# ---------- IAM for ECS tasks ----------
+# Trust policy for ECS tasks to assume roles
+data "aws_iam_policy_document" "ecs_task_exec_assume" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+# Execution role: lets Fargate pull from ECR and push logs to CloudWatch
+resource "aws_iam_role" "ecs_task_execution" {
+  name               = "${local.name}-ecs-task-exec"
+  assume_role_policy = data.aws_iam_policy_document.ecs_task_exec_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_exec_attach" {
+  role       = aws_iam_role.ecs_task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# Task role: permissions for your app itself (empty for now; we’ll add later)
+resource "aws_iam_role" "ecs_task_role" {
+  name               = "${local.name}-ecs-task-role"
+  assume_role_policy = data.aws_iam_policy_document.ecs_task_exec_assume.json
+}
+
+# ---------- Logging ----------
+resource "aws_cloudwatch_log_group" "api" {
+  name              = "/ecs/${local.name}-api"
+  retention_in_days = 14
+}
+
